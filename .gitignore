@@ -1,1 +1,12 @@
 .env
+
+bin/
+tmp/
+
+*.exe
+*.test
+
+.vscode/
+.idea/
+
+.DS_Store
