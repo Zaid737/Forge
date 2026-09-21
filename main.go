@@ -38,12 +38,14 @@ type EmbedResponse struct {
 }
 
 type DocumentRequest struct {
-	Content string `json:"content" binding:"required"`
+	Content   string `json:"content" binding:"required"`
+	ChunkSize int    `json:"chunk_size"`
+	Overlap   int    `json:"overlap"`
 }
 
 type DocumentResponse struct {
-	ID      int64  `json:"id"`
-	Content string `json:"content"`
+	IDs    []int64 `json:"ids"`
+	Chunks int     `json:"chunks"`
 }
 
 type SearchRequest struct {
@@ -54,6 +56,16 @@ type SearchResult struct {
 	ID         int64   `json:"id"`
 	Content    string  `json:"content"`
 	Similarity float64 `json:"similarity"`
+}
+
+type RAGRequest struct {
+	Query     string  `json:"query" binding:"required"`
+	TopK      int     `json:"top_k"`
+	Threshold float64 `json:"threshold"`
+}
+
+type RAGResponse struct {
+	Answer string `json:"answer"`
 }
 
 func cosineSimilarity(a, b []float64) float64 {
@@ -100,6 +112,38 @@ func createEmbedding(
 	return response.Data[0].Embedding, nil
 }
 
+func chunkText(text string, chunkSize, overlap int) []string {
+	if chunkSize <= 0 {
+		return nil
+	}
+
+	if overlap < 0 || overlap >= chunkSize {
+		overlap = 0
+	}
+
+	var chunks []string
+
+	start := 0
+
+	for start < len(text) {
+		end := start + chunkSize
+
+		if end > len(text) {
+			end = len(text)
+		}
+
+		chunks = append(chunks, text[start:end])
+
+		if end == len(text) {
+			break
+		}
+
+		start = end - overlap
+	}
+
+	return chunks
+}
+
 func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found")
@@ -129,9 +173,6 @@ func main() {
 	}
 
 	db, err := pgx.ConnectConfig(context.Background(), dbConfig)
-	if err != nil {
-		log.Fatal("PostgreSQL connection failed:", err)
-	}
 	if err != nil {
 		log.Fatal("PostgreSQL connection failed:", err)
 	}
@@ -324,14 +365,43 @@ func main() {
 			return
 		}
 
-		embedding, err := createEmbedding(
-			c.Request.Context(),
-			client,
+		chunkSize := req.ChunkSize
+
+		if chunkSize == 0 {
+			chunkSize = 1000
+		}
+
+		overlap := req.Overlap
+
+		if overlap == 0 {
+			overlap = 200
+		}
+
+		if overlap >= chunkSize {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "overlap must be smaller than chunk size",
+			})
+			return
+		}
+
+		chunks := chunkText(
 			req.Content,
+			chunkSize,
+			overlap,
 		)
 
+		if len(chunks) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "content could not be chunked",
+			})
+			return
+		}
+
+		ids := make([]int64, 0, len(chunks))
+
+		tx, err := db.Begin(c.Request.Context())
 		if err != nil {
-			log.Println("Embedding error:", err)
+			log.Println("Transaction error:", err)
 
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error": err.Error(),
@@ -339,29 +409,66 @@ func main() {
 			return
 		}
 
-		vector := "["
-		for i, value := range embedding {
-			if i > 0 {
-				vector += ","
+		defer tx.Rollback(c.Request.Context())
+
+		for _, chunk := range chunks {
+			embedding, err := createEmbedding(
+				c.Request.Context(),
+				client,
+				chunk,
+			)
+
+			if err != nil {
+				log.Println("Embedding error:", err)
+
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": err.Error(),
+				})
+				return
 			}
 
-			vector += strconv.FormatFloat(value, 'f', -1, 64)
+			vector := "["
+
+			for i, value := range embedding {
+				if i > 0 {
+					vector += ","
+				}
+
+				vector += strconv.FormatFloat(
+					value,
+					'f',
+					-1,
+					64,
+				)
+			}
+
+			vector += "]"
+
+			var id int64
+
+			err = tx.QueryRow(
+				c.Request.Context(),
+				`INSERT INTO documents (content, embedding)
+				 VALUES ($1, $2::vector)
+				 RETURNING id`,
+				chunk,
+				vector,
+			).Scan(&id)
+
+			if err != nil {
+				log.Println("Database error:", err)
+
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": err.Error(),
+				})
+				return
+			}
+
+			ids = append(ids, id)
 		}
-		vector += "]"
 
-		var id int64
-
-		err = db.QueryRow(
-			c.Request.Context(),
-			`INSERT INTO documents (content, embedding)
-			 VALUES ($1, $2::vector)
-			 RETURNING id`,
-			req.Content,
-			vector,
-		).Scan(&id)
-
-		if err != nil {
-			log.Println("Database error:", err)
+		if err := tx.Commit(c.Request.Context()); err != nil {
+			log.Println("Transaction commit error:", err)
 
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error": err.Error(),
@@ -370,8 +477,8 @@ func main() {
 		}
 
 		c.JSON(http.StatusCreated, DocumentResponse{
-			ID:      id,
-			Content: req.Content,
+			IDs:    ids,
+			Chunks: len(chunks),
 		})
 	})
 
@@ -407,7 +514,12 @@ func main() {
 				vector += ","
 			}
 
-			vector += strconv.FormatFloat(value, 'f', -1, 64)
+			vector += strconv.FormatFloat(
+				value,
+				'f',
+				-1,
+				64,
+			)
 		}
 
 		vector += "]"
@@ -465,6 +577,168 @@ func main() {
 
 		c.JSON(http.StatusOK, gin.H{
 			"results": results,
+		})
+	})
+
+	router.POST("/v1/ai/rag", func(c *gin.Context) {
+		var req RAGRequest
+
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": err.Error(),
+			})
+			return
+		}
+
+		topK := req.TopK
+
+		if topK <= 0 {
+			topK = 5
+		}
+
+		if topK > 20 {
+			topK = 20
+		}
+
+		threshold := req.Threshold
+
+		if threshold <= 0 {
+			threshold = 0.3
+		}
+
+		embedding, err := createEmbedding(
+			c.Request.Context(),
+			client,
+			req.Query,
+		)
+
+		if err != nil {
+			log.Println("Embedding error:", err)
+
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": err.Error(),
+			})
+			return
+		}
+
+		vector := "["
+
+		for i, value := range embedding {
+			if i > 0 {
+				vector += ","
+			}
+
+			vector += strconv.FormatFloat(
+				value,
+				'f',
+				-1,
+				64,
+			)
+		}
+
+		vector += "]"
+
+		rows, err := db.Query(
+			c.Request.Context(),
+			`SELECT
+			content,
+			1 - (embedding <=> $1::vector) AS similarity
+		FROM documents
+		WHERE 1 - (embedding <=> $1::vector) >= $2
+		ORDER BY embedding <=> $1::vector
+		LIMIT $3`,
+			vector,
+			threshold,
+			topK,
+		)
+
+		if err != nil {
+			log.Println("Database search error:", err)
+
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": err.Error(),
+			})
+			return
+		}
+
+		defer rows.Close()
+
+		var contextText string
+		resultCount := 0
+
+		for rows.Next() {
+			var content string
+			var similarity float64
+
+			if err := rows.Scan(
+				&content,
+				&similarity,
+			); err != nil {
+				log.Println("Row scan error:", err)
+
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": err.Error(),
+				})
+				return
+			}
+
+			contextText += "\n---\n" + content
+			resultCount++
+		}
+
+		if err := rows.Err(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": err.Error(),
+			})
+			return
+		}
+
+		if resultCount == 0 {
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": "no relevant documents found",
+			})
+			return
+		}
+
+		prompt := "Answer the user's question using only the provided context. " +
+			"If the answer cannot be found in the context, say that the information " +
+			"is not available in the provided context.\n\n" +
+			"Context:\n" +
+			contextText +
+			"\n\nQuestion:\n" +
+			req.Query
+
+		response, err := client.Chat.Completions.New(
+			c.Request.Context(),
+			openai.ChatCompletionNewParams{
+				Model: openai.ChatModelGPT4o,
+				Messages: []openai.ChatCompletionMessageParamUnion{
+					openai.SystemMessage(
+						"You are ForgeAI, a helpful RAG assistant. " +
+							"Answer questions using only the supplied context. " +
+							"Do not invent information.",
+					),
+					openai.UserMessage(prompt),
+				},
+			},
+		)
+
+		if err != nil {
+			log.Println("OpenAI error:", err)
+
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": err.Error(),
+			})
+			return
+		}
+
+		answer := response.Choices[0].Message.Content
+
+		c.JSON(http.StatusOK, gin.H{
+			"answer":      answer,
+			"chunks_used": resultCount,
+			"top_k":       topK,
+			"threshold":   threshold,
 		})
 	})
 
